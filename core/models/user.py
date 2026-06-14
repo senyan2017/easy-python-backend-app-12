@@ -12,7 +12,18 @@ class User(Document):
     def save(self, *args, **kwargs):
         self.updated_at = datetime.utcnow()
         return super(User, self).save(*args, **kwargs)
-    
+
+
+    def to_dict(self):
+        # Public representation safe to return to clients (never includes password)
+        return {
+            "id": str(self.id),
+            "username": self.username,
+            "email": self.email,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
 
     @classmethod
     def find_one(cls, **kwargs):

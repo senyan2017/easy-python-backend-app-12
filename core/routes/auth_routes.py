@@ -2,7 +2,7 @@ from flask import Blueprint, request, jsonify
 from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
 from werkzeug.security import check_password_hash, generate_password_hash
 from core.models.user import User
-from mongoengine import connect
+from mongoengine import connect, NotUniqueError
 from bson import ObjectId
 from os import environ
 
@@ -30,8 +30,11 @@ def register():
         return jsonify({"msg": "Email already exists"}), 400
     
     user = User(username=username, password=password, email=email)
-    user.save()
-    
+    try:
+        user.save()
+    except NotUniqueError:  # Safety net in case the unique index trips despite the checks above
+        return jsonify({"msg": "Username or email already exists"}), 400
+
     return jsonify({'result': 'ok'}), 201
 
 
@@ -49,7 +52,9 @@ def login():
     # Convert the ObjectId to a string
     user_id_str = str(user.id)
 
-    return jsonify(access_token=create_access_token(identity=user_id_str)), 200
+    access_token = create_access_token(identity=user_id_str)
+    # Return basic profile alongside the token so the client doesn't need a follow-up request
+    return jsonify(access_token=access_token, user=user.to_dict()), 200
 
 
 
@@ -60,7 +65,7 @@ def check_auth():
     user = User.find_one(id=ObjectId(identity))
     if not user:
         return jsonify({"msg": "User not found"}), 404
-    return jsonify({"username": user.username, "email": user.email}), 200
+    return jsonify(user.to_dict()), 200
 
 
 
@@ -74,18 +79,42 @@ def logout():
 @bp.route('/updateProfile', methods=['PATCH'])
 @jwt_required()
 def update_profile():
-    new_username = request.form.get('new_username', None)
-
     current_identity = get_jwt_identity()
-
     current_user = User.find_one(id=ObjectId(current_identity))
+    if current_user is None:
+        return jsonify({"msg": "User not found"}), 404
 
-    if new_username is not None:
-        if User.find_one(username=new_username):
+    new_username = (request.form.get('new_username') or '').strip() or None
+    new_email = (request.form.get('new_email') or '').strip() or None
+    new_password = request.form.get('new_password') or None  # not stripped: spaces may be intentional
+    current_password = request.form.get('current_password') or None
+
+    if new_username is None and new_email is None and new_password is None:
+        return jsonify({"msg": "No fields to update"}), 400
+
+    # Username: only touch it when a different value is supplied
+    if new_username is not None and new_username != current_user.username:
+        if User.find_one(username=new_username) is not None:
             return jsonify({"msg": "Desired username has already been taken"}), 400
-
         current_user.username = new_username
 
-    current_user.save()
+    # Email: only touch it when a different value is supplied
+    if new_email is not None and new_email != current_user.email:
+        if User.find_one(email=new_email) is not None:
+            return jsonify({"msg": "Desired email has already been taken"}), 400
+        current_user.email = new_email
 
-    return jsonify({"msg": "Profile updated successfully!"}), 200
+    # Password: require and verify the current password before changing it
+    if new_password is not None:
+        if current_password is None:
+            return jsonify({"msg": "Current password is required to set a new password"}), 400
+        if not check_password_hash(current_user.password, current_password):
+            return jsonify({"msg": "Current password is incorrect"}), 401
+        current_user.password = new_password  # hashed by the pre_save signal
+
+    try:
+        current_user.save()
+    except NotUniqueError:  # Guard against a race between the checks above and the unique index
+        return jsonify({"msg": "Username or email already exists"}), 400
+
+    return jsonify({"msg": "Profile updated successfully!", "user": current_user.to_dict()}), 200
